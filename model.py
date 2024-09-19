@@ -1,10 +1,9 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class AlexNet(nn.Module):
-    def __init__(self, num_classes=1000):
+    def __init__(self, num_classes=200):  # Tiny ImageNet has 200 classes
         super(AlexNet, self).__init__()
 
         self.features = nn.Sequential(
@@ -27,22 +26,30 @@ class AlexNet(nn.Module):
             nn.MaxPool2d(kernel_size=3, stride=2),  # Max Pooling Layer 3
         )
 
+        # Use adaptive pooling to ensure output size is fixed
+        self.avgpool = nn.AdaptiveAvgPool2d((6, 6))
+
+        # Fully connected layers
         self.classifier = nn.Sequential(
             nn.Dropout(),
-            nn.Linear(256 * 6 * 6, 4096),  # FC Layer 1
+            nn.Linear(256 , 4096),  # Adjusted for 64x64 input (256 channels * 6 * 6 feature map)
             nn.ReLU(inplace=True),
             nn.Dropout(),
-            nn.Linear(4096, 4096),  # FC Layer 2
+            nn.Linear(4096, 4096),
             nn.ReLU(inplace=True),
             nn.Linear(4096, num_classes),  # Output Layer
         )
 
     def forward(self, x):
         x = self.features(x)
-        x = torch.flatten(x, 1)  # Flatten the output from conv layers
+        # print(x.size())
+        # x = self.avgpool(x)  # Apply adaptive pooling to ensure the output size is 6x6
+        # print(x.size())
+        x = torch.flatten(x, 1)  # Flatten the output
+        # print(x.size())
         x = self.classifier(x)
         return x
 
 
 # Example of model creation
-model = AlexNet(num_classes=1000)  # 1000 is the default number of classes in ImageNet
+# model = AlexNet(num_classes=200)  # 200 classes for Tiny ImageNet
