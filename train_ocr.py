@@ -50,6 +50,8 @@ train_loader = DataLoader(dataset=train_dataset, batch_size=16, shuffle=True, nu
 # Device configuration
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 student_model = SimpleCRAFT().to(device)
+student_model.train()
+print(sum(dict((p.data_ptr(), p.numel()) for p in student_model.parameters()).values()))
 teacher_model = CRAFT().to(device)
 teacher_model.load_state_dict(copyStateDict(torch.load("/home/vakidzaci/.EasyOCR/model/craft_mlt_25k.pth", map_location=device)))
 teacher_model.eval()
@@ -76,6 +78,15 @@ def train_model(num_epochs):
             optimizer.zero_grad()
 
             running_loss += loss.item()
+            # Validation loss
+        val_loss = 0.0
+        with torch.no_grad():
+            for images in val_loader:
+                images = images.to(device)
+                teacher_outputs = teacher_model(images)
+                student_outputs = student_model(images)
+                loss = criterion(student_outputs, teacher_outputs)
+                val_loss += loss.item()
 
         print(f'Epoch {epoch+1}/{num_epochs}, Loss: {running_loss/len(train_loader)}')
 
