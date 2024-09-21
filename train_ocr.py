@@ -10,10 +10,10 @@ import os
 from PIL import Image
 # Define your custom dataset
 class CustomDataset(Dataset):
-    def __init__(self, data_dir, transform=None):
+    def __init__(self, data_dir, filenames, transform=None):
         self.data_dir = data_dir
         self.transform = transform
-        self.images = os.listdir(data_dir)
+        self.images = filenames
 
     def __len__(self):
         return len(self.images)
@@ -43,9 +43,18 @@ def copyStateDict(state_dict):
         new_state_dict[name] = v
     return new_state_dict
 
+train_dir = 'dataset/training_data/images'
+val_dir = 'dataset/training_data/images'
+
+train_filenames = os.listdir(train_dir)
+val_filenames = os.listdir(val_dir)
+
 # Load your dataset
-train_dataset = CustomDataset('data', transform=data_transforms)
+train_dataset = CustomDataset(train_dir, train_filenames, transform=data_transforms)
 train_loader = DataLoader(dataset=train_dataset, batch_size=16, shuffle=True, num_workers=4)
+
+val_dataset = CustomDataset(val_dir, val_filenames, transform=data_transforms)
+val_loader = DataLoader(dataset=val_dataset, batch_size=16, shuffle=True, num_workers=4)
 
 # Device configuration
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -60,11 +69,17 @@ teacher_model.eval()
 criterion = nn.MSELoss()
 optimizer = optim.Adam(student_model.parameters(), lr=0.001)
 
+def save_model(model, model_name):
+    torch.save(model)
 # Training function
+import time
 def train_model(num_epochs):
     student_model.train()
+    print(student_model)
+    best_val_loss = 1
     for epoch in range(num_epochs):
         running_loss = 0.0
+        start = time.time()
         for images in train_loader:
             images = images.to(device)
 
@@ -85,11 +100,16 @@ def train_model(num_epochs):
                 images = images.to(device)
                 teacher_outputs = teacher_model(images)
                 student_outputs = student_model(images)
-                loss = criterion(student_outputs, teacher_outputs)
+                loss = criterion(student_outputs[0], teacher_outputs[0])
+                # print(teacher_outputs[0].size(), student_outputs[0].size())
                 val_loss += loss.item()
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(student_model.state_dict(), f'checkpoints/best_model_epoch_{epoch+1}_val_loss_{val_loss}.pth')
+            print(f'Saved new best model at epoch {epoch+1} with Validation Loss: {val_loss}')
 
-        print(f'Epoch {epoch+1}/{num_epochs}, Loss: {running_loss/len(train_loader)}')
+        print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {running_loss/len(train_loader)}, Val loss: {val_loss/len(val_loader)}, time: {time.time() - start}')
 
 # Entry point for running the training
 if __name__ == '__main__':
-    train_model(num_epochs=10)
+    train_model(num_epochs=100)

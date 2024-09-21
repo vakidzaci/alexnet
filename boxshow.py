@@ -1,3 +1,4 @@
+import easyocr
 import torch
 import cv2
 from student import SimpleCRAFT  # Make sure this is the correct import path
@@ -5,7 +6,7 @@ from torchvision.transforms import Compose, ToTensor, Normalize, Resize
 
 
 def load_model(model_path):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")
     model = SimpleCRAFT().to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
@@ -37,20 +38,37 @@ def draw_boxes(image, boxes):
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
-
+import time
 def main(model_path, image_path):
     model, device = load_model(model_path)
-    input_image = preprocess_image(image_path)
-    input_image = input_image.to(device)
-
-    with torch.no_grad():
-        boxes = model(input_image)  # Ensure model outputs bounding box coordinates in [(x1, y1, x2, y2), ...] format
-
-    original_image = cv2.imread(image_path)  # Load original image again to draw boxes
-    draw_boxes(original_image, boxes.cpu().numpy())  # Convert boxes to NumPy array if necessary
-
+    model = model.to(device)
+    reader = easyocr.Reader(['en'], gpu=False)
+    reader.detector = model
+    total = 0
+    # for i in range(100):
+    start = time.time()
+    res = reader.readtext(image_path)
+    t = (time.time() - start)
+    total += t
+    # print(total/100)
+    return res
 
 if __name__ == "__main__":
-    model_path = "path_to_your_model.pth"
-    image_path = "path_to_your_test_image.jpg"
-    main(model_path, image_path)
+    model_path = "checkpoints/best_model_epoch_91_val_loss_0.005805369408335537.pth"
+    image_path = "dataset/testing_data/images/82092117.png"
+    res = main(model_path, image_path)
+
+    image = cv2.imread(image_path)
+    print(res)
+    for bbox, word ,score in res:
+        tl = bbox[0]
+        br = bbox[2]
+        tl[0] = int(tl[0])
+        tl[1] = int(tl[1])
+        br[0] = int(br[0])
+        br[1] = int(br[1])
+        cv2.rectangle(image, tl, br, (0, 255, 0), 2)
+    cv2.imshow("image", image)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+    # print(res)
