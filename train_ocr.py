@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms as transforms
-from student import SimpleCRAFT  # Ensure this is implemented correctly
+from student import mediumCRAFT  # Ensure this is implemented correctly
 from easyocr.craft import CRAFT
 from collections import OrderedDict
 import os
@@ -47,7 +47,7 @@ val_loader = DataLoader(dataset=val_dataset, batch_size=16, shuffle=True, num_wo
 # Device configuration
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # device = torch.device("cpu")
-student_model = SimpleCRAFT().to(device)
+student_model = mediumCRAFT().to(device)
 student_model.train()
 print(sum(dict((p.data_ptr(), p.numel()) for p in student_model.parameters()).values()))
 teacher_model = CRAFT().to(device)
@@ -55,8 +55,8 @@ teacher_model.load_state_dict(copyStateDict(torch.load("/home/vakidzaci/.EasyOCR
 teacher_model.eval()
 
 # Loss function and optimizer
-# criterion = nn.MSELoss()
-criterion = CombinedLoss()
+criterion = nn.MSELoss()
+# criterion = CombinedLoss()
 optimizer = optim.Adam(student_model.parameters(), lr=0.001)
 
 def save_model(model, model_name):
@@ -76,11 +76,11 @@ def train_model(num_epochs):
             with torch.no_grad():
                 teacher_outputs,_ = teacher_model(images)
                 # print(teacher_outputs)
-                teacher_outputs = torch.sigmoid(teacher_outputs)
+                # teacher_outputs = torch.sigmoid(teacher_outputs)
 
             student_outputs,_ = student_model(images)
             # print(student_outputs)
-            student_outputs = torch.sigmoid(student_outputs)
+            # student_outputs = torch.sigmoid(student_outputs)
             loss = criterion(student_outputs, teacher_outputs)
             loss.backward()
             optimizer.step()
@@ -94,9 +94,9 @@ def train_model(num_epochs):
             for images in val_loader:
                 images = images.to(device)
                 teacher_outputs,_ = teacher_model(images)
-                teacher_outputs = torch.sigmoid(teacher_outputs)
+                # teacher_outputs = torch.sigmoid(teacher_outputs)
                 student_outputs,_ = student_model(images)
-                student_outputs = torch.sigmoid(student_outputs)
+                # student_outputs = torch.sigmoid(student_outputs)
                 loss = criterion(student_outputs, teacher_outputs)
                 # print(teacher_outputs[0].size/path/to/cdip_dataset(), student_outputs[0].size())
                 val_loss += loss.item()
@@ -109,5 +109,6 @@ def train_model(num_epochs):
 
 # Entry point for running the training
 if __name__ == '__main__':
+    print("start training")
     train_model(num_epochs=100)
     # print(len(dataset))

@@ -144,7 +144,7 @@ class simple_double_conv(nn.Module):
 # Simplified CRAFT model
 class mediumCRAFT(nn.Module):
     def __init__(self):
-        super(SimpleCRAFT, self).__init__()
+        super(mediumCRAFT, self).__init__()
 
         # Base VGG-like architecture (slice1 to slice4) with reduced channels
         self.slice1 = nn.Sequential(
@@ -199,7 +199,7 @@ class mediumCRAFT(nn.Module):
         self.upconv1 = simple_double_conv(768, 256)  # Combining slice5 (512) and slice4 (256)
         self.upconv2 = simple_double_conv(384, 128)  # Combining upconv1 (256) and slice3 (128)
         self.upconv3 = simple_double_conv(192, 64)  # Combining upconv2 (128) and slice2 (64)
-        self.upconv4 = simple_double_conv(96, 32)  # Combining upconv3 (64) and slice1 (32)
+        self.upconv4 = simple_double_conv(96, 64)  # Combining upconv3 (64) and slice1 (32)
 
         # Final classification layer with reduced parameters
         self.conv_cls = nn.Sequential(
@@ -221,14 +221,19 @@ class mediumCRAFT(nn.Module):
         y3 = self.slice3(y2)
         y4 = self.slice4(y3)
         y5 = self.slice5(y4)
-
+        # print(y1.size(), y2.size(), y3.size(), y4.size(), y5.size(),)
         # Decoder path (up-sampling)
         up1 = self.upconv1(torch.cat([y5, y4], dim=1))
-        up2 = self.upconv2(torch.cat([up1, y3], dim=1))
-        up3 = self.upconv3(torch.cat([up2, y2], dim=1))
-        up4 = self.upconv4(torch.cat([up3, y1], dim=1))
 
+        up2 = self.upconv2(torch.cat([up1, y4], dim=1))
+        up2 = F.interpolate(up2, size=y3.size()[2:], mode='bilinear', align_corners=False)
+        up3 = self.upconv3(torch.cat([up2, y3], dim=1))
+        up3 = F.interpolate(up3, size=y2.size()[2:], mode='bilinear', align_corners=False)
+        up4 = self.upconv4(torch.cat([up3, y2], dim=1))
+        up4 = F.interpolate(up4, size=y1.size()[2:], mode='bilinear', align_corners=False)
+        # print(up4.size(), y1.size())
+        # print(torch.cat([up4, y1]).size())
         # Final classification layer
         output = self.conv_cls(up4)
 
-        return output
+        return output.permute(0, 2, 3, 1), up4
