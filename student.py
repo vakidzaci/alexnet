@@ -83,7 +83,8 @@ class SimpleCRAFT(nn.Module):
 
         # Classification head
         self.conv_cls = nn.Sequential(
-            nn.Conv2d(4, 4, kernel_size=3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(4, 4, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
             nn.Conv2d(4, 2, kernel_size=1)  # Output 2 channels: region and affinity maps
         )
 
@@ -117,3 +118,117 @@ class SimpleCRAFT(nn.Module):
         y = self.conv_cls(feature)
         # print("Final", y.size())
         return y.permute(0, 2, 3, 1), feature
+
+
+import torch
+import torch.nn as nn
+
+
+# Simpler double convolution layer with reduced channels
+class simple_double_conv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(simple_double_conv, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels // 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels // 2),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+# Simplified CRAFT model
+class mediumCRAFT(nn.Module):
+    def __init__(self):
+        super(SimpleCRAFT, self).__init__()
+
+        # Base VGG-like architecture (slice1 to slice4) with reduced channels
+        self.slice1 = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2)
+        )
+
+        self.slice2 = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2)
+        )
+
+        self.slice3 = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2)
+        )
+
+        self.slice4 = nn.Sequential(
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2)
+        )
+
+        # Reduced number of channels and layers in slice5
+        self.slice5 = nn.Sequential(
+            nn.MaxPool2d(kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1),  # Fewer filters than before
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=1, stride=1)  # Fewer parameters overall
+        )
+
+        # Simpler upsampling layers (double_conv layers) with reduced channels
+        self.upconv1 = simple_double_conv(768, 256)  # Combining slice5 (512) and slice4 (256)
+        self.upconv2 = simple_double_conv(384, 128)  # Combining upconv1 (256) and slice3 (128)
+        self.upconv3 = simple_double_conv(192, 64)  # Combining upconv2 (128) and slice2 (64)
+        self.upconv4 = simple_double_conv(96, 32)  # Combining upconv3 (64) and slice1 (32)
+
+        # Final classification layer with reduced parameters
+        self.conv_cls = nn.Sequential(
+            nn.Conv2d(32, 16, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 16, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 8, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(8, 8, kernel_size=1, stride=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(8, 2, kernel_size=1, stride=1)
+        )
+
+    def forward(self, x):
+        # Encoder path (down-sampling)
+        y1 = self.slice1(x)
+        y2 = self.slice2(y1)
+        y3 = self.slice3(y2)
+        y4 = self.slice4(y3)
+        y5 = self.slice5(y4)
+
+        # Decoder path (up-sampling)
+        up1 = self.upconv1(torch.cat([y5, y4], dim=1))
+        up2 = self.upconv2(torch.cat([up1, y3], dim=1))
+        up3 = self.upconv3(torch.cat([up2, y2], dim=1))
+        up4 = self.upconv4(torch.cat([up3, y1], dim=1))
+
+        # Final classification layer
+        output = self.conv_cls(up4)
+
+        return output

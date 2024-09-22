@@ -47,15 +47,17 @@ def main(model_path, image_path):
     total = 0
     # for i in range(100):
     start = time.time()
-    res = reader.readtext(image_path)
+    res = reader.readtext(image_path, text_threshold=0)
     t = (time.time() - start)
     total += t
     # print(total/100)
     return res
 
 if __name__ == "__main__":
-    model_path = "checkpoints/best_model_epoch_91_val_loss_0.005805369408335537.pth"
-    image_path = "dataset/testing_data/images/82092117.png"
+    model_path = "checkpoints/best_model_epoch_21_val_loss_8.286911774617197e-05.pth"
+    # image_path = "dataset/testing_data/images/82092117.png"
+    image_path = "scan2.jpg"
+    # image_path = "dataset/testing_data/images/"
     res = main(model_path, image_path)
 
     image = cv2.imread(image_path)
@@ -68,6 +70,7 @@ if __name__ == "__main__":
         br[0] = int(br[0])
         br[1] = int(br[1])
         cv2.rectangle(image, tl, br, (0, 255, 0), 2)
+    image = cv2.resize(image, (0,0), fx=0.5, fy=0.5)
     cv2.imshow("image", image)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
