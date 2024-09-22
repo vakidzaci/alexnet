@@ -209,7 +209,7 @@ class mediumCRAFT(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(16, 8, kernel_size=3, stride=1, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(8, 8, kernel_size=1, stride=1),
+            nn.Conv2d(8, 8, kernel_size=1, stride=1)    ,
             nn.ReLU(inplace=True),
             nn.Conv2d(8, 2, kernel_size=1, stride=1)
         )

@@ -1,13 +1,13 @@
 import easyocr
 import torch
 import cv2
-from student import SimpleCRAFT  # Make sure this is the correct import path
+from student import SimpleCRAFT, mediumCRAFT # Make sure this is the correct import path
 from torchvision.transforms import Compose, ToTensor, Normalize, Resize
 
 
 def load_model(model_path):
-    device = torch.device("cpu")
-    model = SimpleCRAFT().to(device)
+    device = torch.device("cuda")
+    model = mediumCRAFT().to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
     return model, device
@@ -39,11 +39,8 @@ def draw_boxes(image, boxes):
     cv2.destroyAllWindows()
 
 import time
-def main(model_path, image_path):
-    model, device = load_model(model_path)
-    model = model.to(device)
-    reader = easyocr.Reader(['en'], gpu=False)
-    reader.detector = model
+def main(reader, image_path):
+
     total = 0
     # for i in range(100):
     start = time.time()
@@ -54,24 +51,33 @@ def main(model_path, image_path):
     return res
 
 if __name__ == "__main__":
-    model_path = "checkpoints/best_model_epoch_21_val_loss_8.286911774617197e-05.pth"
-    # image_path = "dataset/testing_data/images/82092117.png"
-    image_path = "scan2.jpg"
+    model_path = "checkpoints/best.pth"
+    dir = "dataset/testing_data/images"
+    # image_path = "scan2.jpg"
     # image_path = "dataset/testing_data/images/"
-    res = main(model_path, image_path)
 
-    image = cv2.imread(image_path)
-    print(res)
-    for bbox, word ,score in res:
-        tl = bbox[0]
-        br = bbox[2]
-        tl[0] = int(tl[0])
-        tl[1] = int(tl[1])
-        br[0] = int(br[0])
-        br[1] = int(br[1])
-        cv2.rectangle(image, tl, br, (0, 255, 0), 2)
-    image = cv2.resize(image, (0,0), fx=0.5, fy=0.5)
-    cv2.imshow("image", image)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+    model, device = load_model(model_path)
+    model = model.to(device)
+    reader = easyocr.Reader(['en'], gpu=True)
+    reader.detector = model
+    import os
+    filenames = os.listdir(dir)
+    for i in range(len(filenames)):
+        image_path = os.path.join(dir, filenames[i])
+        res = main(reader, image_path)
+
+        image = cv2.imread(image_path)
+        # print(res)
+        for bbox, word ,score in res:
+            tl = bbox[0]
+            br = bbox[2]
+            tl[0] = int(tl[0])
+            tl[1] = int(tl[1])
+            br[0] = int(br[0])
+            br[1] = int(br[1])
+            cv2.rectangle(image, tl, br, (0, 255, 0), 2)
+        # image = cv2.resize(image, (0,0), fx=0.5, fy=0.5)
+        cv2.imshow("image", image)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
     # print(res)

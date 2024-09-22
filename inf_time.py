@@ -1,7 +1,7 @@
 import torch
 import time
 import numpy as np
-from student import SimpleCRAFT  # Import your student model
+from student import SimpleCRAFT,mediumCRAFT  # Import your student model
 from easyocr.craft import CRAFT  # Import the teacher model (pre-trained CRAFT model)
 from torchvision.transforms import Compose, ToTensor, Normalize, Resize
 from collections import OrderedDict
@@ -30,8 +30,9 @@ def copyStateDict(state_dict):
         new_state_dict[name] = v
     return new_state_dict
 # Initialize models
-device = torch.device("cpu")  # Ensure models and data are on CPU
-student_model = SimpleCRAFT().to(device)
+device = torch.device("cuda")  # Ensure models and data are on CPU
+student_model = mediumCRAFT().to(device)
+student_model.load_state_dict(copyStateDict(torch.load("checkpoints/best.pth", map_location=device)))
 teacher_model = CRAFT().to(device)
 teacher_model.load_state_dict(copyStateDict(torch.load("/home/vakidzaci/.EasyOCR/model/craft_mlt_25k.pth", map_location=device)))
 teacher_model.eval()
@@ -41,7 +42,7 @@ student_model.eval()
 teacher_model.eval()
 
 # Function to measure inference time
-def measure_inference_time(model, input_image, runs=100):
+def measure_inference_time(model, input_image, runs=1000):
     # Warm up
     with torch.no_grad():
         for _ in range(10):
@@ -54,10 +55,11 @@ def measure_inference_time(model, input_image, runs=100):
             _ = model(input_image)
     end_time = time.time()
     return (end_time - start_time) / runs  # Average time per inference
+image = image.to(device)
 
 # Measure inference time
-student_time = measure_inference_time(student_model, image, 100)
-teacher_time = measure_inference_time(teacher_model, image, 100)
+student_time = measure_inference_time(student_model, image, 10000)
+teacher_time = measure_inference_time(teacher_model, image, 10000)
 
 print(f"Average inference time on CPU - Student Model: {student_time:.5f} seconds")
 print(f"Average inference time on CPU - Teacher Model: {teacher_time:.5f} seconds")
