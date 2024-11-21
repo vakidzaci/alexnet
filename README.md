@@ -198,3 +198,56 @@ def aggregate_page_results(results):
 def aggregate_document_results(results):
     print(results)
     return results
+
+
+
+
+@app.route('/ocr', methods=['POST'])
+def upload_tiff():
+    file = request.files['file']
+    if file and file.filename.endswith('.tif'):
+        tiff_data = file.read()
+        task_id = str(uuid.uuid4())
+
+        # Enqueue the OCR_task on a specific queue
+        result = OCR_task.apply_async(args=[tiff_data, task_id], queue='ocr_queue')
+
+
+        # Return the task ID immediately
+        return jsonify({"task_id": task_id}), 202
+    else:
+        return jsonify({"error": "Invalid file format. Only TIFF files are allowed."}), 400
+
+
+
+@app.route('/status/<task_id>', methods=['GET'])
+def get_status(task_id):
+    task = celery.AsyncResult(task_id)
+    if task.state == 'PENDING':
+        response = {
+            'state': task.state,
+            'status': 'Task is still in progress...'
+        }
+    elif task.state == 'FAILURE':
+        response = {
+            'state': task.state,
+            'status': str(task.info)
+        }
+    else:
+
+        # task_id_res = task.result[0][0][0]
+        # print(task_id_res)
+        # res = celery.AsyncResult(task_id_res).result
+        ids = []
+        results = []
+        for i in range(len(task.result)):
+            task_id_res = task.result[i][0][0]
+            ids.append(task_id_res)
+            res = celery.AsyncResult(task_id_res).result
+            results.append(res)
+        response = {
+            'state': task.state,
+            'idres' : ids,
+            'result': results  # Ensure that task.result is JSON-serializable
+        }
+    return jsonify(response)
