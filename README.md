@@ -1,253 +1,180 @@
-
-from .utils import divide_tiff_into_pages
-import easyocr
-from celery import Celery
-from celery import group, chord, Task
-from .config import Config
-import numpy as np
-import base64
-import cv2
-from easyocr.utils import reformat_input
-from easyocr.recognition import get_text
+import string
+import argparse
 import torch
-torch.set_num_threads(1)
+import torch.backends.cudnn as cudnn
+import torch.nn.functional as F
+from utils import AttnLabelConverter
+from model import Model
+from easyocr import Reader
+from PIL import Image, ImageDraw, ImageFont
+import numpy as np
+from collections import OrderedDict
 
-celery = Celery(__name__)
-celery.conf.broker_url = Config.CELERY_BROKER_URL
-celery.conf.result_backend = Config.CELERY_RESULT_BACKEND
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-
-class EasyOCRReaderTask(Task):
-    reader = None  # Cache the reader per worker process
-
-    def __call__(self, *args, **kwargs):
-        if self.reader is None:
-            # Initialize the EasyOCR Reader once per worker process
-            self.reader = easyocr.Reader(['en'], gpu=False)
-        return super().__call__(*args, **kwargs)
-
-
-@celery.task(name='tasks.OCR_task')
-def OCR_task(tiff_data, task_id):
-    """
-    Orchestrates OCR for a multi-page TIFF document.
-    Args:
-        tiff_data: The TIFF file data.
-        task_id: Task ID for tracking.
-    Returns:
-        Aggregated OCR results for all pages.
-    """
-    # Step 1: Divide the TIFF file into pages
-    pages = divide_tiff_into_pages(tiff_data)
-
-    # Step 2: Trigger detection tasks for all pages using a chord
-    detection_tasks = group(
-        detect_task.s(page).set(queue="detect_queue") for page in pages
-    )
-    final_result = chord(detection_tasks)(
-        aggregate_page_results.s().set(queue="aggregate_page_queue", task_id=task_id)
-    )
-
-    # Return an async result that can be tracked
-    return final_result
+def preprocess_image(image_path, box, imgH, imgW, PAD=True):
+    """Crop and preprocess the image based on the bounding box (x1,y1,x2,y2)."""
+    x1, y1, x2, y2 = box
+    image = Image.open(image_path).convert('L')
+    cropped = image.crop((x1, y1, x2, y2))
+    cropped = cropped.resize((imgW, imgH), Image.BICUBIC)
+    image_arr = np.array(cropped) / 255.0  # Normalize to [0,1]
+    image_arr = np.expand_dims(image_arr, axis=0)  # (C,H,W)
+    image_tensor = torch.FloatTensor(image_arr).unsqueeze(0)  # (N,C,H,W)
+    return image_tensor.to(device)
 
 
-@celery.task(name='tasks.detect', base=EasyOCRReaderTask)
-def detect_task(page_data):
-    """
-    Detect text regions in the image and trigger recognition tasks for each region.
-    Args:
-        page_data: Image data for the page.
-    Returns:
-        Aggregated recognized text for the page.
-    """
-    reader = detect_task.reader
-    if reader.recognizer is not None:
-        del detect_task.reader.recognizer
-        detect_task.reader.recognizer = None
-    img, img_cv_grey = reformat_input(page_data)
+def detect_and_recognize_with_display(opt):
+    """Detect text regions, recognize text, and place them on a blank image side-by-side with the original."""
+    # Initialize EasyOCR Reader
+    reader = Reader(['en'], gpu=torch.cuda.is_available())
 
-    # Perform detection
-    horizontal_list, free_list = reader.detect(
-        img,
-        min_size=20,
-        text_threshold=0.7,
-        low_text=0.4,
-        link_threshold=0.4,
-        canvas_size=2560,
-        mag_ratio=1.0,
-        slope_ths=0.1,
-        ycenter_ths=0.5,
-        height_ths=0.5,
-        width_ths=0.5,
-        add_margin=0.1,
-        threshold=0.2,
-        bbox_min_score=0.2,
-        bbox_min_size=3,
-        max_candidates=0,
-    )
+    # Detect text regions
+    detection_results = reader.detect(opt.image_path, link_threshold = 0.9, width_ths=0.5, height_ths=0.5)
+    if not detection_results:
+        print("No text regions detected.")
+        return
 
-    result = []
+    hor_list, free_list = detection_results
+    hor_list, free_list = hor_list[0], free_list[0]
 
-    to_read = []
+    # Initialize the recognition model
+    converter = AttnLabelConverter(opt.character)
+    opt.num_class = len(converter.character)
+    model = Model(opt)
+    state_dict = torch.load(opt.saved_model, map_location=device)
+    new_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        name = k.replace("module.", "")
+        new_state_dict[name] = v
 
-    for bbox in horizontal_list[0]:
-        h_list = [bbox]
-        f_list = []
-        image_list, max_width = easyocr.utils.get_image_list(h_list, f_list, img_cv_grey, model_height=64)
-        to_read.append([image_list, max_width])
+    print('Loading pretrained model from %s' % opt.saved_model)
+    model.load_state_dict(new_state_dict)
+    model = model.to(device)
+    model.eval()
 
-    to_read_base64 = []
-    for image_list, max_width in to_read:
-        image_list_base64 = []
-        boxes = []
-        for bbox, crop_img in image_list:
-            _, buffer = cv2.imencode('.png', crop_img)
-            img_base64 = base64.b64encode(buffer).decode('utf-8')
-            image_list_base64.append(img_base64)
-            boxes.append(bbox)
-        boxes = [[[int(coord[0]), int(coord[1])] for coord in region] for region in boxes]
-        to_read_base64.append((image_list_base64, boxes, max_width))
+    recognized_texts = []
 
-    # Flatten and combine detected regions
-    # print(horizontal_list)
-    # print(free_list)
-    all_regions = horizontal_list[0]  #+ free_list[0]
+    # Recognize text from each detected region
+    with torch.no_grad():
+        for idx, box in enumerate(hor_list):
+            # EasyOCR returns box as (x1, x2, y1, y2)
+            # Reorder to (x1,y1,x2,y2) for cropping
+            x1, x2, y1, y2 = box
+            box_reordered = [x1, y1, x2, y2]
 
-    # Encode the image to Base64 for transmission
+            image_tensor = preprocess_image(opt.image_path, box_reordered, opt.imgH, opt.imgW, opt.PAD)
 
-    # Convert numpy types to plain Python types
-    all_regions = [list(map(int, region)) for region in all_regions]
+            length_for_pred = torch.IntTensor([opt.batch_max_length]).to(device)
+            text_for_pred = torch.LongTensor(1, opt.batch_max_length + 1).fill_(0).to(device)
+            preds = model(image_tensor, text_for_pred, is_train=False)
 
-    # Trigger recognition tasks for all regions using a chord
+            # Decode predictions
+            _, preds_index = preds.max(2)
+            preds_str = converter.decode(preds_index, length_for_pred)
 
-    recognition_tasks = group(
-        recognize_task.s({"image_list_base64": image_list, "boxes": boxes, "max_width": max_width}).set(queue="recognize_queue")
-        for image_list, boxes, max_width in to_read_base64
-    )
-    return chord(recognition_tasks)(aggregate_document_results.s().set(queue="aggregate_document_queue"))
+            # Confidence score
+            preds_prob = F.softmax(preds, dim=2)
+            preds_max_prob, _ = preds_prob.max(dim=2)
+            pred = preds_str[0]
+            pred_EOS = pred.find('[s]')
+            pred = pred[:pred_EOS]
+            pred_max_prob = preds_max_prob[0, :pred_EOS]
+            confidence_score = pred_max_prob.cumprod(dim=0)[-1] if pred_max_prob.nelement() > 0 else 0.0
 
+            recognized_texts.append((pred, (x1, y1, x2, y2)))
+            print(f"Recognized Text: {pred}, Confidence Score: {confidence_score:.4f}")
 
-@celery.task(name='tasks.recognize', base=EasyOCRReaderTask)
-def recognize_task(data):
-    """
-    Recognize text from a single detected region.
-    Args:
-        data: Contains a single region and the Base64-encoded image.
-    Returns:
-        Recognized text for the region.
-    """
-    reader = recognize_task.reader
-    if reader.detector is not None:
-        del reader.detector
-        reader.detector = None
+    # Create a blank image of the same size as the original
+    original_image = Image.open(opt.image_path).convert('RGB')
+    width, height = original_image.size
 
-    # Decode the Base64 image
-    image_list_base64 = data['image_list_base64']
-    max_width = data['max_width']
-    boxes = data['boxes']
+    # Draw detection bounding boxes on the original image
+    draw_orig = ImageDraw.Draw(original_image)
+    for box in hor_list:
+        x1, x2, y1, y2 = box
+        left, top, right, bottom = x1, y1, x2, y2
+        draw_orig.rectangle([left, top, right, bottom], outline='red', width=2)
 
-    image_list = []
-    for img_base64, box in zip(image_list_base64,boxes):
-        img_data = base64.b64decode(img_base64)
-        img_cv_grey = cv2.imdecode(np.frombuffer(img_data, np.uint8), cv2.IMREAD_GRAYSCALE)
-        image_list.append((box, img_cv_grey))
+    text_image = Image.new('RGB', (width, height), 'white')
+    draw_text = ImageDraw.Draw(text_image)
 
-    # Perform recognition for the specific region
-    # region = [data['region']]  # Wrap in a list since recognize expects a list
-    # result = reader.recognize(
-    #     img_cv_grey,
-    #     horizontal_list=region,
-    #     free_list=[],
-    #     decoder='greedy',
-    #     beamWidth=5,
-    #     batch_size=1,
-    #     workers=0,
-    #     allowlist=None,
-    #     blocklist=None,
-    #     detail=0,
-    #     rotation_info=None,
-    #     paragraph=False,
-    #     contrast_ths=0.1,
-    #     adjust_contrast=0.5,
-    #     filter_ths=0.003,
-    #     y_ths=0.5,
-    #     x_ths=1.0,
-    #     output_format="standard"
-    # )
+    # Draw recognized text at the corresponding coordinates on the blank image
+    for (text, (x1, y1, x2, y2)) in recognized_texts:
+        box_width = x2 - x1
+        box_height = y2 - y1
 
-    ignore_char = ''.join(set(recognize_task.reader.character) - set(recognize_task.reader.lang_char))
-    print(ignore_char)
-    result0 = get_text(recognize_task.reader.character, 64, int(max_width), recognize_task.reader.recognizer,
-                       recognize_task.reader.converter, image_list,
-                       ignore_char, "greedy", 5, 1, 0.1, 0.5, 0.003,
-                       0, 'cpu')
+        # Estimate font size from box height
+        font_size = 40
+        try:
+            font = ImageFont.truetype("arial.ttf", font_size)
+        except IOError:
+            font = ImageFont.load_default(font_size)
 
-    # Return recognized text
-    print(result0)
-    return " ".join([item[1] for item in result0])
+        # Adjust font size if needed
+        while True:
+            x0, y0, x1_text, y1_text = font.getbbox(text)
+            text_width = x1_text - x0
+            text_height = y1_text - y0
+            if text_width <= box_width and text_height <= box_height:
+                break
+            font_size -= 1
+            if font_size < 8:
+                # Too small to shrink further
+                break
+            try:
+                font = ImageFont.truetype("arial.ttf", font_size)
+            except IOError:
+                font = ImageFont.load_default(font_size)
+
+        # Center text within the bounding box
+        x0, y0, x1_text, y1_text = font.getbbox(text)
+        text_height = y1_text - y0
+        text_width = x1_text - x0
+        text_x = x1 + (box_width - text_width) // 2
+        text_y = y1 + (box_height - text_height) // 2
+
+        draw_text.text((text_x, text_y), text, font=font, fill='black')
+
+    # Combine original with bounding boxes and text image side-by-side
+    combined_image = Image.new('RGB', (2 * width, height), 'white')
+    combined_image.paste(original_image, (0, 0))
+    combined_image.paste(text_image, (width, 0))
+
+    # Save and show the combined image
+    combined_image.save('combined_output.png')
+    print("Combined image saved as 'combined_output.png'.")
+    combined_image.show()
 
 
-@celery.task(name='tasks.aggregate_page_results')
-def aggregate_page_results(results):
-    print(results[0][0][0])
-    return results
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--workers', type=int, help='number of data loading workers', default=4)
+    parser.add_argument('--batch_size', type=int, default=1, help='input batch size')
+    parser.add_argument('--rgb', action='store_true', help='use rgb input')
+    parser.add_argument('--sensitive', action='store_true', help='for sensitive character mode')
 
+    parser.add_argument('--image_path', required=True, help='path to the image file')
+    parser.add_argument('--saved_model', required=True, help="path to saved_model to evaluation")
+    parser.add_argument('--batch_max_length', type=int, default=200, help='maximum-label-length')
+    parser.add_argument('--imgH', type=int, default=32, help='the height of the input image')
+    parser.add_argument('--imgW', type=int, default=100, help='the width of the input image')
+    parser.add_argument('--PAD', action='store_true', help='whether to keep ratio then pad for image resize')
+    parser.add_argument('--character', type=str, default='0123456789abcdefghijklmnopqrstuvwxyz', help='character label')
+    parser.add_argument('--hidden_size', type=int, default=256, help='the size of the LSTM hidden state')
+    parser.add_argument('--Transformation', default='TPS', type=str, help='Transformation stage. None|TPS')
+    parser.add_argument('--FeatureExtraction', default='ResNet', type=str, help='FeatureExtraction stage. VGG|RCNN|ResNet')
+    parser.add_argument('--SequenceModeling', default='BiLSTM', type=str, help='SequenceModeling stage. None|BiLSTM')
+    parser.add_argument('--Prediction', default='Attn', type=str, help='Prediction stage. CTC|Attn')
+    parser.add_argument('--num_fiducial', type=int, default=20, help='number of fiducial points of TPS-STN')
+    parser.add_argument('--input_channel', type=int, default=1, help='the number of input channel of Feature extractor')
+    parser.add_argument('--output_channel', type=int, default=512,
+                        help='the number of output channel of Feature extractor')
 
-@celery.task(name='tasks.aggregate_document_results')
-def aggregate_document_results(results):
-    print(results)
-    return results
+    opt = parser.parse_args()
 
+    cudnn.benchmark = True
+    cudnn.deterministic = True
+    opt.num_gpu = torch.cuda.device_count()
 
-
-
-@app.route('/ocr', methods=['POST'])
-def upload_tiff():
-    file = request.files['file']
-    if file and file.filename.endswith('.tif'):
-        tiff_data = file.read()
-        task_id = str(uuid.uuid4())
-
-        # Enqueue the OCR_task on a specific queue
-        result = OCR_task.apply_async(args=[tiff_data, task_id], queue='ocr_queue')
-
-
-        # Return the task ID immediately
-        return jsonify({"task_id": task_id}), 202
-    else:
-        return jsonify({"error": "Invalid file format. Only TIFF files are allowed."}), 400
-
-
-
-@app.route('/status/<task_id>', methods=['GET'])
-def get_status(task_id):
-    task = celery.AsyncResult(task_id)
-    if task.state == 'PENDING':
-        response = {
-            'state': task.state,
-            'status': 'Task is still in progress...'
-        }
-    elif task.state == 'FAILURE':
-        response = {
-            'state': task.state,
-            'status': str(task.info)
-        }
-    else:
-
-        # task_id_res = task.result[0][0][0]
-        # print(task_id_res)
-        # res = celery.AsyncResult(task_id_res).result
-        ids = []
-        results = []
-        for i in range(len(task.result)):
-            task_id_res = task.result[i][0][0]
-            ids.append(task_id_res)
-            res = celery.AsyncResult(task_id_res).result
-            results.append(res)
-        response = {
-            'state': task.state,
-            'idres' : ids,
-            'result': results  # Ensure that task.result is JSON-serializable
-        }
-    return jsonify(response)
+    detect_and_recognize_with_display(opt)
