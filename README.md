@@ -1,259 +1,268 @@
-import string
-import argparse
 import torch
-import torch.backends.cudnn as cudnn
+import torch.nn as nn
 import torch.nn.functional as F
-from utils import AttnLabelConverter
-from model import Model
-from easyocr import Reader
-from PIL import Image, ImageDraw, ImageFont
+
+
+class VGG_FeatureExtractor(nn.Module):
+    def __init__(self):
+        super(VGG_FeatureExtractor, self).__init__()
+        self.ConvNet = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=(2, 1), stride=(2, 1)),
+
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=(2, 1), stride=(2, 1)),
+
+            nn.Conv2d(256, 256, kernel_size=2, stride=1),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.ConvNet(x)
+
+
+class AdaptiveAvgPoolDynamic(nn.Module):
+    """
+    This custom layer will adaptively pool only the width dimension down to 1,
+    leaving the height dimension unchanged.
+    """
+
+    def __init__(self, output_size=(None, 1)):
+        super(AdaptiveAvgPoolDynamic, self).__init__()
+        if output_size != (None, 1):
+            raise ValueError("This custom layer only supports output_size=(None, 1).")
+
+    def forward(self, x):
+        # x: [B, C, H, W]
+        # We want to keep H the same and reduce W to 1 via average pooling
+        B, C, H, W = x.size()
+        # Use adaptive_avg_pool2d to pool along the width dimension
+        # Set the target output size to (H, 1)
+        return F.adaptive_avg_pool2d(x, (H, 1))
+
+
+# Construct the full model
+model = nn.Sequential(
+    VGG_FeatureExtractor(),
+    AdaptiveAvgPoolDynamic((None, 1))
+)
+
+
+
+
+import math
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from PIL import Image
 import numpy as np
-from collections import OrderedDict
+import os
+
+####################################
+# Dummy function for contrast adjustment (if needed)
+
+####################################
+def custom_mean(x):
+    return x.prod()**(2.0/np.sqrt(len(x)))
+
+def contrast_grey(img):
+    high = np.percentile(img, 90)
+    low  = np.percentile(img, 10)
+    return (high-low)/np.maximum(10, high+low), high, low
+
+def adjust_contrast_grey(img, target = 0.4):
+    contrast, high, low = contrast_grey(img)
+    if contrast < target:
+        img = img.astype(int)
+        ratio = 200./np.maximum(10, high-low)
+        img = (img - low + 25)*ratio
+        img = np.maximum(np.full(img.shape, 0) ,np.minimum(np.full(img.shape, 255), img)).astype(np.uint8)
+    return img
+
+####################################
+# Dataset: Loads images from a list of file paths
+####################################
+class ListDataset(torch.utils.data.Dataset):
+
+    def __init__(self, image_list):
+        self.image_list = image_list
+        self.nSamples = len(image_list)
+
+    def __len__(self):
+        return self.nSamples
+
+    def __getitem__(self, index):
+        img = self.image_list[index]
+        return Image.fromarray(img, 'L')
+
+
+####################################
+# Normalization and Padding
+####################################
+class NormalizePAD(object):
+    def __init__(self, max_size, PAD_type='right'):
+        self.toTensor = transforms.ToTensor()
+        self.max_size = max_size
+        self.max_width_half = math.floor(max_size[2] / 2)
+        self.PAD_type = PAD_type
+
+    def __call__(self, img):
+        # Convert and normalize: (img - 0.5)/0.5 shifts [0,1] range to [-1,1]
+        img = self.toTensor(img)
+        img.sub_(0.5).div_(0.5)
+        c, h, w = img.size()
+        Pad_img = torch.FloatTensor(*self.max_size).fill_(0)
+        Pad_img[:, :, :w] = img  # right pad
+        if self.max_size[2] != w:
+            Pad_img[:, :, w:] = img[:, :, w - 1].unsqueeze(2).expand(c, h, self.max_size[2] - w)
+        return Pad_img
+
+
+####################################
+# Collate function for DataLoader
+####################################
+class AlignCollate(object):
+    def __init__(self, imgH=32, imgW=100, keep_ratio_with_pad=False, adjust_contrast=0.):
+        self.imgH = imgH
+        self.imgW = imgW
+        self.keep_ratio_with_pad = keep_ratio_with_pad
+        self.adjust_contrast = adjust_contrast
+
+    def __call__(self, batch):
+        batch = list(filter(lambda x: x is not None, batch))
+        images = batch
+
+        resized_max_w = self.imgW
+        input_channel = 1
+        transform = NormalizePAD((input_channel, self.imgH, resized_max_w))
+
+        resized_images = []
+        for image in images:
+            w, h = image.size
+
+            # Optional contrast adjustment
+            if self.adjust_contrast > 0:
+                image = np.array(image)
+                image = adjust_contrast_grey(image, target=self.adjust_contrast)
+                image = Image.fromarray(image, 'L')
+
+            ratio = w / float(h)
+            if math.ceil(self.imgH * ratio) > self.imgW:
+                resized_w = self.imgW
+            else:
+                resized_w = math.ceil(self.imgH * ratio)
+
+            resized_image = image.resize((resized_w, self.imgH), Image.BICUBIC)
+            resized_images.append(transform(resized_image))
+
+        image_tensors = torch.cat([t.unsqueeze(0) for t in resized_images], 0)
+        return image_tensors
+
+
+####################################
+# Load the feature extractor model
+####################################
+# This assumes you have saved a truncated model state_dict as `feature_extractor.pth`
+# The truncated model should contain something like:
+# feature_extractor = nn.Sequential(
+#     base_model.FeatureExtraction,
+#     base_model.AdaptiveAvgPool
+# )
+from feature_ext import VGG_FeatureExtractor, AdaptiveAvgPoolDynamic
+
+model = nn.Sequential(
+    VGG_FeatureExtractor(),
+    AdaptiveAvgPoolDynamic((None, 1))
+)
+# Instantiate your truncated feature extractor and load weights
+feature_extractor = model
+feature_extractor.load_state_dict(torch.load("feature_extractor.pth", map_location='cpu'))
+feature_extractor.eval()
+
+def calculate_ratio(width,height):
+    '''
+    Calculate aspect ratio for normal use case (w>h) and vertical text (h>w)
+    '''
+    ratio = width/height
+    if ratio<1.0:
+        ratio = 1./ratio
+    return ratio
+
 import cv2
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-def segment_sentence_into_words(sentence_image):
-    """
-    Segments a sentence image into individual word images.
-    """
-    if len(sentence_image.shape) == 3:  # If the image is not grayscale
-        sentence_image = cv2.cvtColor(sentence_image, cv2.COLOR_BGR2GRAY)
-
-    _, binary_image = cv2.threshold(sentence_image, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (20, 1))
-    dilated_image = cv2.dilate(binary_image, kernel, iterations=1)
-
-    vertical_projection = np.sum(dilated_image, axis=0)
-
-    threshold = 0
-    word_boundaries = []
-    in_word = False
-    start_idx = 0
-
-    for i, value in enumerate(vertical_projection):
-        if value > threshold and not in_word:
-            start_idx = i
-            in_word = True
-        elif value <= threshold and in_word:
-            word_boundaries.append((start_idx, i))
-            in_word = False
-
-    if in_word:
-        word_boundaries.append((start_idx, len(vertical_projection)))
-
-    word_images = []
-    for start, end in word_boundaries:
-        if end - start > 10:
-            word_image = sentence_image[:, start:end]
-            word_images.append(word_image)
-
-    return word_images
+def compute_ratio_and_resize(img,width,height,model_height):
+    '''
+    Calculate ratio and resize correctly for both horizontal text
+    and vertical case
+    '''
+    ratio = width/height
+    if ratio<1.0:
+        ratio = calculate_ratio(width,height)
+        img = cv2.resize(img,(model_height,int(model_height*ratio)), interpolation=Image.Resampling.LANCZOS)
+    else:
+        img = cv2.resize(img,(int(model_height*ratio),model_height),interpolation=Image.Resampling.LANCZOS)
+    return img, ratio
 
 
-def preprocess_image(cropped, imgH, imgW, PAD=True, binary=False):
-    """Crop and preprocess the image."""
-    cropped = cropped.resize((imgW, imgH), Image.BICUBIC)
-    image_arr = np.array(cropped)
+img_list = []
 
-    if binary:
-        image_arr = cv2.adaptiveThreshold(image_arr, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, \
-                                          cv2.THRESH_BINARY, 11, 2)
+for filename in os.listdir("test_data_for_clustering"):
+    img_path = os.path.join("test_data_for_clustering", filename)
+    img = cv2.imread(img_path,0)
+    w,h = img.shape
+    img,_ = compute_ratio_and_resize(img,w,h,32)
+    img_list.append(img)
 
-    image_arr = image_arr / 255.0  # Normalize to [0,1]
-    image_arr = np.expand_dims(image_arr, axis=0)  # (C,H,W)
-    image_tensor = torch.FloatTensor(image_arr).unsqueeze(0)  # (N,C,H,W)
+batch_size = 16
+workers = 4
+imgH = 32
+imgW = 100
 
-    return image_tensor.to(device)
-
-
-def predict(image_tensor, model, converter, opt):
-    """
-    Run prediction on a batch of images.
-    image_tensor: (batch_size, C, H, W)
-    """
-    batch_size = image_tensor.size(0)
-    length_for_pred = torch.IntTensor([opt.batch_max_length] * batch_size).to(device)
-    text_for_pred = torch.LongTensor(batch_size, opt.batch_max_length + 1).fill_(0).to(device)
-    preds = model(image_tensor, text_for_pred, is_train=False)
-
-    _, preds_index = preds.max(2)
-    preds_str = converter.decode(preds_index, length_for_pred)
-    preds_prob = F.softmax(preds, dim=2)
-    preds_max_prob, _ = preds_prob.max(dim=2)
-
-    results = []
-    for i, pred in enumerate(preds_str):
-        pred_EOS = pred.find('[s]')
-        pred_text = pred[:pred_EOS]
-        pred_max_prob = preds_max_prob[i, :pred_EOS]
-        confidence_score = pred_max_prob.cumprod(dim=0)[-1].item() if pred_max_prob.nelement() > 0 else 0.0
-        results.append((pred_text, confidence_score))
-    return results
+AlignCollate_normal = AlignCollate(imgH=imgH, imgW=imgW, keep_ratio_with_pad=True, adjust_contrast=0.0)
+test_data = ListDataset(img_list)
+test_loader = DataLoader(
+    test_data, batch_size=batch_size, shuffle=False,
+    num_workers=int(workers), collate_fn=AlignCollate_normal, pin_memory=True
+)
 
 
-def detect_and_recognize_with_display(opt):
-    reader = Reader(['en'], gpu=torch.cuda.is_available(), recognizer=False)
+all_features = []
+with torch.no_grad():
+    for batch_images in test_loader:
+        # batch_images: [B, 1, imgH, imgW]
+        features = feature_extractor(batch_images)  # shape depends on your model architecture
+        # Suppose features are [B, C, H, W]
+        # After AdaptiveAvgPool, H might be 1, so features: [B, C, W]
+        # If height dimension is still there, try squeezing: features = features.squeeze(3) if features.dim()==4
+        if features.dim() == 4:
+            # Expected shape: [B, C, H, W] -> after AdaptiveAvgPool, H should be 1:
+            features = features.squeeze(3)  # Now features: [B, C, W]
 
-    detection_results = reader.detect(opt.image_path)
-    if not detection_results:
-        print("No text regions detected.")
-        return
+        # Now pool across width to get a single vector per image
+        # Mean pooling across width dimension:
+        features_vector = features.mean(dim=2)  # [B, C]
 
-    hor_list, free_list = detection_results
-    hor_list, free_list = hor_list[0], free_list[0]
+        all_features.append(features_vector.cpu().numpy())
 
-    converter = AttnLabelConverter(opt.character)
-    opt.num_class = len(converter.character)
-    model = Model(opt)
-    state_dict = torch.load(opt.saved_model, map_location=device)
-    new_state_dict = OrderedDict()
-    for k, v in state_dict.items():
-        name = k.replace("module.", "")
-        new_state_dict[name] = v
+# Concatenate all features
+all_features = np.concatenate(all_features, axis=0)  # [N, C] N=total images, C=256 or whatever your channel dim is.
 
-    print('Loading pretrained model from %s' % opt.saved_model)
-    model.load_state_dict(new_state_dict)
-    model = model.to(device)
-    model.eval()
-
-    recognized_texts = []
-    score_color = []
-    confidences = []
-    confidences_by_word_count = {}
-
-    image = Image.open(opt.image_path).convert('L')
-    original_image = Image.open(opt.image_path).convert('RGB')
-    width, height = original_image.size
-    draw_orig = ImageDraw.Draw(original_image)
-
-    # Preprocess all images and stack them into a batch
-    image_tensors = []
-    boxes = []
-    for idx, box in enumerate(hor_list):
-        x1, x2, y1, y2 = box
-        cropped = image.crop((x1, y1, x2, y2))
-        image_tensor = preprocess_image(cropped, opt.imgH, opt.imgW, opt.PAD)
-        image_tensors.append(image_tensor)
-        boxes.append(box)
-
-    # Combine all tensors into one batch
-    if len(image_tensors) == 0:
-        print("No detected text regions to process.")
-        return
-    batch_image_tensor = torch.cat(image_tensors, dim=0)
-
-    # Predict for the entire batch
-    with torch.no_grad():
-        predictions = predict(batch_image_tensor, model, converter, opt)
-
-    # Process predictions
-    for i, (pred, confidence_score) in enumerate(predictions):
-        x1, x2, y1, y2 = boxes[i]
-        recognized_texts.append((pred, (x1, y1, x2, y2)))
-
-        print(f"Recognized Text: {pred}, Confidence Score: {confidence_score:.4f}")
-
-        if len(pred) not in confidences_by_word_count:
-            confidences_by_word_count[len(pred)] = [float(confidence_score)]
-        else:
-            confidences_by_word_count[len(pred)].append(float(confidence_score))
-
-        confidences.append(confidence_score)
-
-        if confidence_score > 0.9:
-            score_color.append('green')
-        elif confidence_score > 0.5:
-            score_color.append('blue')
-        else:
-            score_color.append('red')
-
-    # Draw bounding boxes
-    for i, box in enumerate(hor_list):
-        x1, x2, y1, y2 = box
-        left, top, right, bottom = x1, y1, x2, y2
-        draw_orig.rectangle([left, top, right, bottom], outline=score_color[i], width=2)
-
-    text_image = Image.new('RGB', (width, height), 'white')
-    draw_text = ImageDraw.Draw(text_image)
-
-    for (text, (x1, y1, x2, y2)) in recognized_texts:
-        box_width = x2 - x1
-        box_height = y2 - y1
-
-        font_size = 35
-        try:
-            font = ImageFont.truetype("arial.ttf", font_size)
-        except IOError:
-            font = ImageFont.load_default()
-
-        # Adjust font size
-        while True:
-            x0, y0, x1_text, y1_text = font.getbbox(text)
-            text_width = x1_text - x0
-            text_height = y1_text - y0
-            if text_width <= box_width and text_height <= box_height:
-                break
-            font_size -= 1
-            if font_size < 8:
-                break
-            try:
-                font = ImageFont.truetype("arial.ttf", font_size)
-            except IOError:
-                font = ImageFont.load_default()
-
-        # Center text
-        x0, y0, x1_text, y1_text = font.getbbox(text)
-        text_height = y1_text - y0
-        text_width = x1_text - x0
-        text_x = x1 + (box_width - text_width) // 2
-        text_y = y1 + (box_height - text_height) // 2
-
-        draw_text.text((text_x, text_y), text, font=font, fill='black')
-
-    combined_image = Image.new('RGB', (2 * width, height), 'white')
-    combined_image.paste(original_image, (0, 0))
-    combined_image.paste(text_image, (width, 0))
-
-    combined_image.save('combined_output2.png')
-    print("Combined image saved as 'combined_output2.png'.")
-    print(f"confidence average: {sum(confidences)/len(confidences) if confidences else 0}")
-    print(confidences_by_word_count)
-    keys = list(confidences_by_word_count.keys())
-    keys.sort()
-    for key in keys:
-        val = confidences_by_word_count[key]
-        print(key, sum(val)/len(val))
-    combined_image.show()
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--workers', type=int, default=4)
-    parser.add_argument('--batch_size', type=int, default=1)
-    parser.add_argument('--rgb', action='store_true')
-    parser.add_argument('--sensitive', action='store_true')
-
-    parser.add_argument('--image_path', required=True)
-    parser.add_argument('--saved_model', required=True)
-    parser.add_argument('--batch_max_length', type=int, default=200)
-    parser.add_argument('--imgH', type=int, default=32)
-    parser.add_argument('--imgW', type=int, default=100)
-    parser.add_argument('--PAD', action='store_true')
-    parser.add_argument('--character', type=str, default=" «»!%&'()*+,-./0123456789:;<=?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]_abcdefghijklmnopqrstuvwxyz|ІАБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмнопрстуфхцчшщъыьэюяёіҒғҚқҢңҮүҰұӘәӨө")
-    parser.add_argument('--hidden_size', type=int, default=256)
-    parser.add_argument('--Transformation', default='TPS', type=str)
-    parser.add_argument('--FeatureExtraction', default='ResNet', type=str)
-    parser.add_argument('--SequenceModeling', default='BiLSTM', type=str)
-    parser.add_argument('--Prediction', default='Attn', type=str)
-    parser.add_argument('--num_fiducial', type=int, default=20)
-    parser.add_argument('--input_channel', type=int, default=1)
-    parser.add_argument('--output_channel', type=int, default=256)
-    opt = parser.parse_args()
-
-    cudnn.benchmark = True
-    cudnn.deterministic = True
-    opt.num_gpu = torch.cuda.device_count()
-
-    detect_and_recognize_with_display(opt)
+# Save features for future clustering
+np.save("image_features.npy", all_features)
+print("Features saved to image_features.npy")
